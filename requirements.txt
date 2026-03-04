@@ -1,0 +1,4 @@
+python-dotenv~=1.2.1
+azure-core~=1.37.0
+openai~=2.15.0
+azure-search-documents
