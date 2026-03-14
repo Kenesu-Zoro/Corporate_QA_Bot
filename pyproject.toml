@@ -3,4 +3,11 @@ name = "corporate-bot"
 version = "0.1.0"
 description = "Add your description here"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "azure-core>=1.38.3",
+    "azure-search>=1.0.0b2",
+    "azure-search-documents>=11.6.0",
+    "openai>=2.28.0",
+    "python-dotenv>=1.2.2",
+    "six>=1.17.0",
+]

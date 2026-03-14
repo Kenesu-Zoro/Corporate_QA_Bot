@@ -2,9 +2,8 @@ import os
 import sys
 import time
 from urllib.parse import unquote
-from dotenv import load_dotenv
 
-# Azure Libraries
+from dotenv import load_dotenv
 from azure.core.credentials import AzureKeyCredential
 from azure.search.documents import SearchClient
 from openai import AzureOpenAI
@@ -21,126 +20,173 @@ SEARCH_API_KEY = os.getenv("AZURE_SEARCH_API_KEY")
 OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
 OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
 OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
-OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION")
+OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-01")
 
 STORAGE_ACCOUNT_URL = os.getenv("AZURE_STORAGE_ACCOUNT_URL")
 CONTAINER_NAME = os.getenv("BLOB_CONTAINER_NAME")
+
+# Change this to the folder you want to target inside the blob container
 MY_FOLDER = "Kenneth"
 
+# Validate required environment variables
+required_vars = {
+    "AZURE_SEARCH_ENDPOINT": SEARCH_ENDPOINT,
+    "AZURE_SEARCH_INDEX_NAME": SEARCH_INDEX_NAME,
+    "AZURE_SEARCH_API_KEY": SEARCH_API_KEY,
+    "AZURE_OPENAI_ENDPOINT": OPENAI_ENDPOINT,
+    "AZURE_OPENAI_API_KEY": OPENAI_API_KEY,
+    "AZURE_OPENAI_DEPLOYMENT_NAME": OPENAI_DEPLOYMENT,
+    "AZURE_OPENAI_API_VERSION": OPENAI_API_VERSION,
+    "AZURE_STORAGE_ACCOUNT_URL": STORAGE_ACCOUNT_URL,
+    "BLOB_CONTAINER_NAME": CONTAINER_NAME,
+}
+
+missing = [key for key, value in required_vars.items() if not value]
+if missing:
+    raise ValueError(
+        f"Missing required environment variables: {', '.join(missing)}"
+    )
 
 # -------------------------------------------------------------------------
-# HELPER: Status Printer
+# HELPERS
 # -------------------------------------------------------------------------
-def print_status(message):
-    """Prints a status message in a clean, distinct way."""
+def print_status(message: str) -> None:
     print(f"   [Processing] {message}")
 
 
-def print_success(message):
-    """Prints a success message."""
+def print_success(message: str) -> None:
     print(f"   [✓] {message}")
 
 
-# -------------------------------------------------------------------------
-# 1. RETRIEVAL
-# -------------------------------------------------------------------------
-def search_documents(query):
-    print_status(f"Connecting to Azure AI Search (Index: {SEARCH_INDEX_NAME})...")
+def print_error(message: str) -> None:
+    print(f"   [!] {message}")
 
-    search_client = SearchClient(
+
+# -------------------------------------------------------------------------
+# AZURE CLIENTS
+# -------------------------------------------------------------------------
+def get_search_client() -> SearchClient:
+    return SearchClient(
         endpoint=SEARCH_ENDPOINT,
         index_name=SEARCH_INDEX_NAME,
-        credential=AzureKeyCredential(SEARCH_API_KEY)
+        credential=AzureKeyCredential(SEARCH_API_KEY),
     )
 
-    folder_prefix = f"{STORAGE_ACCOUNT_URL}/{CONTAINER_NAME}/{MY_FOLDER}/"
-    filter_expression = (
-        f"metadata_storage_path ge '{folder_prefix}' and "
-        f"metadata_storage_path lt '{folder_prefix}~'"
+
+def get_openai_client() -> AzureOpenAI:
+    return AzureOpenAI(
+        azure_endpoint=OPENAI_ENDPOINT,
+        api_key=OPENAI_API_KEY,
+        api_version=OPENAI_API_VERSION,
     )
+
+
+# -------------------------------------------------------------------------
+# RETRIEVAL
+# -------------------------------------------------------------------------
+def search_documents(query: str, use_folder_filter: bool = True, top_k: int = 5) -> list:
+    print_status(f"Connecting to Azure AI Search (Index: {SEARCH_INDEX_NAME})...")
+    search_client = get_search_client()
+
+    search_kwargs = {
+        "search_text": query,
+        "top": top_k,
+        "select": ["content", "metadata_storage_path"],
+    }
+
+    if use_folder_filter:
+        folder_prefix = f"{STORAGE_ACCOUNT_URL}/{CONTAINER_NAME}/{MY_FOLDER}/"
+        filter_expression = (
+            f"metadata_storage_path ge '{folder_prefix}' and "
+            f"metadata_storage_path lt '{folder_prefix}~'"
+        )
+        search_kwargs["filter"] = filter_expression
 
     try:
-        results = search_client.search(
-            search_text=query,
-            filter=filter_expression,
-            top=3,
-            select=["content", "metadata_storage_path"]
-        )
+        results = search_client.search(**search_kwargs)
 
         documents = []
         for result in results:
-            # Extract clean filename from the long URL for citation
-            full_path = result.get("metadata_storage_path")
-            filename = unquote(full_path.split("/")[-1]) if full_path else "Unknown File"
+            full_path = result.get("metadata_storage_path") or ""
+            filename = (
+                unquote(full_path.split("/")[-1]) if full_path else "Unknown File"
+            )
+            content = result.get("content") or ""
 
-            documents.append({
-                "content": result.get("content"),
-                "source": filename,
-                "full_url": full_path
-            })
+            if content.strip():
+                documents.append(
+                    {
+                        "content": content,
+                        "source": filename,
+                        "full_url": full_path,
+                    }
+                )
 
         print_success(f"Search complete. Found {len(documents)} relevant document chunks.")
         return documents
 
     except Exception as e:
-        print(f"   [!] Search Failed: {e}")
+        print_error(f"Search failed: {e}")
         return []
 
 
 # -------------------------------------------------------------------------
-# 2. GENERATION (With Citations & Streaming)
+# GENERATION
 # -------------------------------------------------------------------------
-def stream_chat_response(user_query, context_docs, chat_history):
+def build_context_text(context_docs: list) -> str:
+    if not context_docs:
+        return "No relevant documents found."
+
+    formatted_docs = []
+    for i, doc in enumerate(context_docs, start=1):
+        formatted_docs.append(
+            f"[Document {i}: {doc['source']}]\n"
+            f"{doc['content']}\n"
+            f"[End of Document {i}]"
+        )
+
+    return "\n\n".join(formatted_docs)
+
+
+def stream_chat_response(user_query: str, context_docs: list, chat_history: list) -> str:
     print_status("Generating answer with memory...")
+    client = get_openai_client()
 
-    client = AzureOpenAI(
-        azure_endpoint=OPENAI_ENDPOINT,
-        api_key=OPENAI_API_KEY,
-        api_version=OPENAI_API_VERSION
-    )
+    context_text = build_context_text(context_docs)
 
-    # 1. Prepare Context
-    context_text = ""
-    if context_docs:
-        # We format it so the model clearly sees where the document starts/ends
-        context_text = "\n\n".join([
-            f"--- Document: {doc['source']} ---\n{doc['content']}\n----------------"
-            for doc in context_docs
-        ])
-    else:
-        context_text = "No relevant documents found."
+    system_prompt = """
+You are a helpful corporate assistant.
 
-    # 2. System Prompt (RESTORED CITATION LOGIC)
-    system_prompt = """You are a helpful corporate assistant.
+Rules:
+1. Answer using ONLY the provided Context Excerpts.
+2. If the answer is not in the context, say: "I don't know based on the provided documents."
+3. Add citations at the end of each paragraph or claim.
+4. Use citation format exactly like:
+   [Source: filename]
+   or
+   [Source: filename, Page X]
+5. If page numbers are not present in the context, use only:
+   [Source: filename]
+6. Be concise, accurate, and professional.
+"""
 
-    Guidelines:
-    1. Answer the user's question using ONLY the provided Context Excerpts.
-    2. CITATIONS ARE MANDATORY. At the end of every distinct claim or paragraph, you MUST include a citation.
-    3. Format: [Source: filename, Page X] or [Source: filename].
-    4. LOOK FOR PAGE NUMBERS: If the text chunk mentions "Page X" or "Section Y", you MUST include that in the citation.
-    5. If the answer is not in the context, say "I don't know".
-    6. Be professional and concise."""
+    messages = [{"role": "system", "content": system_prompt.strip()}]
 
-    # 3. Prepare Messages
-    messages = [
-        {"role": "system", "content": system_prompt}
-    ]
-
-    # Add History (Last 4 turns)
+    # Keep only the last 4 messages for short memory
     messages.extend(chat_history[-4:])
 
-    # Add Current Question + Context
-    messages.append({
-        "role": "user",
-        "content": f"Context Excerpts:\n{context_text}\n\nUser Question: {user_query}"
-    })
+    messages.append(
+        {
+            "role": "user",
+            "content": f"Context Excerpts:\n{context_text}\n\nUser Question: {user_query}",
+        }
+    )
 
-    # 4. Stream Response
     try:
         response = client.chat.completions.create(
             model=OPENAI_DEPLOYMENT,
             messages=messages,
-            stream=True
+            stream=True,
         )
 
         print_success("Streaming answer...\n")
@@ -157,47 +203,105 @@ def stream_chat_response(user_query, context_docs, chat_history):
                     time.sleep(0.01)
 
         print("\n")
-        return full_answer
+        return full_answer.strip()
 
     except Exception as e:
-        print(f"\n   [!] OpenAI Error: {e}")
+        print_error(f"OpenAI error: {e}")
         return "I encountered an error generating the response."
+
+
+# -------------------------------------------------------------------------
+# OPTIONAL CONNECTION TESTS
+# -------------------------------------------------------------------------
+def test_search_connection() -> bool:
+    print_status("Testing Azure AI Search connection...")
+    try:
+        search_client = get_search_client()
+        results = search_client.search(
+            search_text="test",
+            top=1,
+            select=["content", "metadata_storage_path"],
+        )
+        list(results)
+        print_success("Azure AI Search connection is working.")
+        return True
+    except Exception as e:
+        print_error(f"Azure AI Search test failed: {e}")
+        return False
+
+
+def test_openai_connection() -> bool:
+    print_status("Testing Azure OpenAI connection...")
+    try:
+        client = get_openai_client()
+        response = client.chat.completions.create(
+            model=OPENAI_DEPLOYMENT,
+            messages=[{"role": "user", "content": "Reply with: connection ok"}],
+            stream=False,
+        )
+        text = response.choices[0].message.content
+        print_success(f"Azure OpenAI connection is working. Response: {text}")
+        return True
+    except Exception as e:
+        print_error(f"Azure OpenAI test failed: {e}")
+        return False
 
 
 # -------------------------------------------------------------------------
 # MAIN LOOP
 # -------------------------------------------------------------------------
 if __name__ == "__main__":
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 70)
     print(f"💬 CORPORATE Q&A BOT (Target Folder: {MY_FOLDER})")
-    print("   commands: type 'exit' or 'quit' to stop.")
-    print("=" * 60 + "\n")
+    print("Commands:")
+    print("  - type 'exit' or 'quit' to stop")
+    print("  - type 'test' to test Azure connections")
+    print("=" * 70 + "\n")
+
+    chat_history = []
 
     while True:
         try:
-            user_input = input("You: ")
+            user_input = input("You: ").strip()
 
-            if user_input.strip().lower() in ["exit", "quit"]:
+            if user_input.lower() in {"exit", "quit"}:
                 print("Exiting bot. Goodbye!")
                 break
 
-            if not user_input.strip():
+            if not user_input:
                 continue
 
-            # Visual Separation for the processing block
-            print("-" * 60)
+            if user_input.lower() == "test":
+                print("-" * 70)
+                test_search_connection()
+                test_openai_connection()
+                print("=" * 70 + "\n")
+                continue
 
-            # 1. Search Phase
-            docs = search_documents(user_input)
+            print("-" * 70)
 
-            # 2. Generation Phase
+            # First try with folder filter
+            docs = search_documents(user_input, use_folder_filter=True, top_k=5)
+
+            # Optional fallback: if nothing found, try without folder filter
+            if not docs:
+                print_status("No results found in target folder. Trying broader search...")
+                docs = search_documents(user_input, use_folder_filter=False, top_k=5)
+
             if docs:
-                stream_chat_response(user_input, docs)
+                answer = stream_chat_response(user_input, docs, chat_history)
+
+                chat_history.append({"role": "user", "content": user_input})
+                chat_history.append({"role": "assistant", "content": answer})
             else:
                 print("\n🤖 Bot: No relevant documents found matching your keywords.\n")
 
-            print("=" * 60 + "\n")
+            print("=" * 70 + "\n")
 
         except KeyboardInterrupt:
-            print("\n\nForce Quit detected. Goodbye!")
+            print("\n\nForce quit detected. Goodbye!")
             break
+
+        except Exception as e:
+            print_error(f"Unexpected error: {e}")
+            print("=" * 70 + "\n")
